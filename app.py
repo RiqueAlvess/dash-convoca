@@ -13,8 +13,6 @@ import time
 import gc
 import warnings
 from flask_caching import Cache
-import psutil
-import sys
 
 # Suprimir avisos para logs mais limpos
 warnings.filterwarnings('ignore')
@@ -24,53 +22,52 @@ pd.options.mode.chained_assignment = None
 
 # Monitoramento de memória
 def get_memory_usage():
-    process = psutil.Process(os.getpid())
-    memory_info = process.memory_info()
-    memory_mb = memory_info.rss / 1024 / 1024
-    return f"Memória: {memory_mb:.1f} MB"
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        return f"Memória: {memory_mb:.1f} MB"
+    except:
+        return "Monitoramento de memória não disponível"
 
 # Funções para gerenciar memória ativamente
 def clear_memory():
     # Forçar coleta de lixo
     gc.collect()
-    
-    # Limpar cache do pandas (experimental)
-    for name in list(sys.modules.keys()):
-        if 'pandas' in name:
-            try:
-                sys.modules[name]._clear_cache()
-            except:
-                pass
 
-# Inicialização mínima do app
-app = dash.Dash(__name__, 
-               external_stylesheets=[dbc.themes.BOOTSTRAP],
-               assets_folder=None,  # Evitar carregamento de assets
-               compress=True,  # Compressão para reduzir tráfego
-               meta_tags=[
-                   {"name": "viewport", "content": "width=device-width, initial-scale=1, maximum-scale=1"}
-               ])
+# Inicialização do app (CORRIGIDO)
+app = dash.Dash(
+    __name__, 
+    external_stylesheets=[dbc.themes.BOOTSTRAP],
+    assets_folder="",  # Diretório vazio em vez de None
+    compress=True,  # Compressão para reduzir tráfego
+    meta_tags=[
+        {"name": "viewport", "content": "width=device-width, initial-scale=1, maximum-scale=1"}
+    ]
+)
 
+# Definir servidor para Gunicorn
 server = app.server
 
 # Configuração de cache eficiente
+cache_dir = './minimal_cache'
+if not os.path.exists(cache_dir):
+    os.makedirs(cache_dir)
+
 cache_config = {
     'CACHE_TYPE': 'filesystem',
-    'CACHE_DIR': os.environ.get('CACHE_DIR', './minimal_cache'),
+    'CACHE_DIR': cache_dir,
     'CACHE_THRESHOLD': 100,  # Limitar número de itens
     'CACHE_DEFAULT_TIMEOUT': 86400  # 24h
 }
-
-# Criar diretório de cache
-if not os.path.exists(cache_config['CACHE_DIR']):
-    os.makedirs(cache_config['CACHE_DIR'])
 
 cache = Cache()
 cache.init_app(server, config=cache_config)
 
 # Arquivo para armazenar resultados agregados (muito menor que dados brutos)
-SUMMARY_FILE = os.path.join(cache_config['CACHE_DIR'], 'data_summary.json')
-LAST_UPDATE_FILE = os.path.join(cache_config['CACHE_DIR'], 'last_update.txt')
+SUMMARY_FILE = os.path.join(cache_dir, 'data_summary.json')
+LAST_UPDATE_FILE = os.path.join(cache_dir, 'last_update.txt')
 
 # Credenciais - prioritize variáveis de ambiente
 API_CONFIG = {
@@ -81,16 +78,6 @@ API_CONFIG = {
     'EMPRESA': os.environ.get('EMPRESA', '423'),
     'CODIGO': os.environ.get('CODIGO', '151346'),
     'CHAVE': os.environ.get('CHAVE', 'b5aa04943cd28ff155ed')
-}
-
-# Configuração de tipos otimizados para memória
-OPTIMIZED_DTYPES = {
-    'CODIGOEMPRESA': 'category',
-    'NOMEABREVIADO': 'category', 
-    'EXAME': 'category',
-    'Status': 'category',
-    'MesAnoVencimento': 'category',
-    'DiasParaVencer': 'int16'  # -32768 a 32767 é suficiente para dias
 }
 
 # Função para extrair dados da API, processando em chunks para economia de memória
@@ -903,6 +890,41 @@ def update_acoes_recomendadas(empresa, start_date, end_date, refresh_time):
             return html.P("Sem dados suficientes para gerar recomendações.", className="text-muted")
     
     return html.Ol(recomendacoes)
+
+# Adicionar uma regra CSS para a cor de fundo
+app.index_string = '''
+<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>Dashboard de Exames Ocupacionais</title>
+        {%favicon%}
+        {%css%}
+        <style>
+            .color-dot {
+                width: 12px;
+                height: 12px;
+                border-radius: 50%;
+                display: inline-block;
+            }
+            .text-right {
+                text-align: right;
+            }
+            body {
+                background-color: #f5f5f5;
+            }
+        </style>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>
+'''
 
 # Iniciar o servidor com configurações otimizadas
 if __name__ == '__main__':
