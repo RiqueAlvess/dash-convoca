@@ -1,281 +1,351 @@
+import dash
+from dash import dcc, html, Input, Output, dash_table
+import dash_bootstrap_components as dbc
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
-from dash import Dash, dcc, html, Input, Output, dash_table
-import dash_bootstrap_components as dbc
 from datetime import datetime, timedelta
 import os
-from flask_caching import Cache
-import gc
-import warnings
 import requests
 import json
 import time
-from pathlib import Path
+import gc
+import warnings
+from flask_caching import Cache
+import psutil
+import sys
+
+# Suprimir avisos para logs mais limpos
 warnings.filterwarnings('ignore')
 
-# Configuração inicial
-app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+# Configuração para uso mínimo de memória
+pd.options.mode.chained_assignment = None
+
+# Monitoramento de memória
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    memory_mb = memory_info.rss / 1024 / 1024
+    return f"Memória: {memory_mb:.1f} MB"
+
+# Funções para gerenciar memória ativamente
+def clear_memory():
+    # Forçar coleta de lixo
+    gc.collect()
+    
+    # Limpar cache do pandas (experimental)
+    for name in list(sys.modules.keys()):
+        if 'pandas' in name:
+            try:
+                sys.modules[name]._clear_cache()
+            except:
+                pass
+
+# Inicialização mínima do app
+app = dash.Dash(__name__, 
+               external_stylesheets=[dbc.themes.BOOTSTRAP],
+               assets_folder=None,  # Evitar carregamento de assets
+               compress=True,  # Compressão para reduzir tráfego
+               meta_tags=[
+                   {"name": "viewport", "content": "width=device-width, initial-scale=1, maximum-scale=1"}
+               ])
+
 server = app.server
 
-# Configurar o cache do Flask
-cache_dir = './flask_cache'
-if not os.path.exists(cache_dir):
-    os.makedirs(cache_dir)
-
+# Configuração de cache eficiente
 cache_config = {
     'CACHE_TYPE': 'filesystem',
-    'CACHE_DIR': cache_dir,
-    'CACHE_DEFAULT_TIMEOUT': 86400  # 24 horas em segundos
+    'CACHE_DIR': os.environ.get('CACHE_DIR', './minimal_cache'),
+    'CACHE_THRESHOLD': 100,  # Limitar número de itens
+    'CACHE_DEFAULT_TIMEOUT': 86400  # 24h
 }
+
+# Criar diretório de cache
+if not os.path.exists(cache_config['CACHE_DIR']):
+    os.makedirs(cache_config['CACHE_DIR'])
+
+cache = Cache()
+cache.init_app(server, config=cache_config)
+
+# Arquivo para armazenar resultados agregados (muito menor que dados brutos)
+SUMMARY_FILE = os.path.join(cache_config['CACHE_DIR'], 'data_summary.json')
+LAST_UPDATE_FILE = os.path.join(cache_config['CACHE_DIR'], 'last_update.txt')
+
+# Credenciais - prioritize variáveis de ambiente
+API_CONFIG = {
+    'URL_SOC': os.environ.get('URL_SOC', 'https://ws1.soc.com.br/WebSoc/exportadados?parametro='),
+    'URL_CONNECT': os.environ.get('URL_CONNECT', 'https://www.grsconnect.com.br/'),
+    'USERNAME': os.environ.get('API_USERNAME', '1'),
+    'PASSWORD': os.environ.get('API_PASSWORD', 'ConnectBI@20482022'),
+    'EMPRESA': os.environ.get('EMPRESA', '423'),
+    'CODIGO': os.environ.get('CODIGO', '151346'),
+    'CHAVE': os.environ.get('CHAVE', 'b5aa04943cd28ff155ed')
+}
+
+# Configuração de tipos otimizados para memória
+OPTIMIZED_DTYPES = {
+    'CODIGOEMPRESA': 'category',
+    'NOMEABREVIADO': 'category', 
+    'EXAME': 'category',
+    'Status': 'category',
+    'MesAnoVencimento': 'category',
+    'DiasParaVencer': 'int16'  # -32768 a 32767 é suficiente para dias
+}
+
+# Função para extrair dados da API, processando em chunks para economia de memória
+def extract_data_from_api(max_empresas=None):
+    """Extrai dados direto da API, processando em chunks para economia de memória"""
+    print(f"[{datetime.now()}] Iniciando extração de dados")
     
-server_cache = Cache()
-server_cache.init_app(app.server, config=cache_config)
-
-# Diretório para cache de dados da API
-data_cache_dir = './data_cache'
-if not os.path.exists(data_cache_dir):
-    os.makedirs(data_cache_dir)
-
-# Arquivo de cache dos dados
-csv_cache_file = os.path.join(data_cache_dir, 'convocacao_grs_nucleo.csv')
-cache_info_file = os.path.join(data_cache_dir, 'cache_info.json')
-
-# Configuração da API (usando variáveis de ambiente ou valores padrão para desenvolvimento)
-URL_SOC = os.environ.get('URL_SOC', 'https://ws1.soc.com.br/WebSoc/exportadados?parametro=')
-URL_CONNECT = os.environ.get('URL_CONNECT', 'https://www.grsconnect.com.br/')
-API_USERNAME = os.environ.get('API_USERNAME', '1')
-API_PASSWORD = os.environ.get('API_PASSWORD', 'ConnectBI@20482022')
-EMPRESA = os.environ.get('EMPRESA', '423')
-CODIGO = os.environ.get('CODIGO', '151346')
-CHAVE = os.environ.get('CHAVE', 'b5aa04943cd28ff155ed')
-
-# Função para verificar se o cache está válido (menos de 24 horas)
-def is_cache_valid():
     try:
-        if not os.path.exists(csv_cache_file) or not os.path.exists(cache_info_file):
-            return False
-        
-        with open(cache_info_file, 'r') as f:
-            cache_info = json.load(f)
-        
-        cache_time = datetime.fromisoformat(cache_info['timestamp'])
-        current_time = datetime.now()
-        
-        # Cache é válido se menos de 24 horas se passaram
-        return (current_time - cache_time).total_seconds() < 86400
-    except Exception as e:
-        print(f"Erro ao verificar cache: {e}")
-        return False
-
-# Função para extrair dados da API e salvar no cache
-def extract_data_from_api():
-    print("Extraindo dados da API...")
-    try:
-        # Obter token
+        # Obter token (reutilizável)
         token_response = requests.get(
-            url=URL_CONNECT + 'get_token',
+            url=API_CONFIG['URL_CONNECT'] + 'get_token',
             params={
-                'username': API_USERNAME,
-                'password': API_PASSWORD
-            }
+                'username': API_CONFIG['USERNAME'],
+                'password': API_CONFIG['PASSWORD']
+            },
+            timeout=30
         )
-        
         token = token_response.json()['token']
         
-        # Obter lista de empresas ativas
+        # Inicialização para armazenar resumos
+        summary_data = {
+            'status_counts': {},
+            'empresas': [],
+            'exames': [],
+            'meses_vencimento': {},
+            'incompany_eligibility': {},
+            'total_records': 0
+        }
+        
+        # Obter empresas ativas
+        print(f"[{datetime.now()}] Obtendo lista de empresas ativas")
         convoca_codigo = pd.json_normalize(requests.get(
-            url=URL_CONNECT + 'get_ped_proc',
-            params={"token": token}
+            url=API_CONFIG['URL_CONNECT'] + 'get_ped_proc',
+            params={"token": token},
+            timeout=30
         ).json())
         
-        # Filtrar empresas ativas
         empresas_ativas = convoca_codigo.query("ativo == True")
         
-        # Coletar dados
-        convocacao_grs_nucleo = []
-        total_empresas = len(empresas_ativas)
-        
-        print(f"Processando {total_empresas} empresas ativas...")
-        
-        for i, row in enumerate(empresas_ativas.itertuples(index=False)):
-            # Exibir progresso
-            if i % 10 == 0:
-                print(f"Processando empresa {i+1}/{total_empresas}...")
+        # Limitar número de empresas para testes ou economia de memória
+        if max_empresas and max_empresas > 0:
+            empresas_ativas = empresas_ativas.head(max_empresas)
             
-            convoca = {
-                "empresa": EMPRESA,
-                "codigo": CODIGO,
-                "chave": CHAVE,
-                "tipoSaida": "json",
-                "empresaTrabalho": str(row.cod_empresa),
-                "codigoSolicitacao": str(row.cod_solicitacao)
-            }
+        total_empresas = len(empresas_ativas)
+        print(f"[{datetime.now()}] Processando {total_empresas} empresas ativas")
+        
+        # Processar cada empresa separadamente para não carregar tudo na memória
+        for i, row in enumerate(empresas_ativas.itertuples(index=False)):
+            # Log de progresso a cada 10 empresas
+            if i % 10 == 0:
+                clear_memory()  # Limpar memória regularmente
+                print(f"[{datetime.now()}] Processando empresa {i+1}/{total_empresas} - {get_memory_usage()}")
             
             try:
-                response = requests.get(url=URL_SOC + str(convoca))
+                # Preparar parâmetros para a API
+                convoca = {
+                    "empresa": API_CONFIG['EMPRESA'],
+                    "codigo": API_CONFIG['CODIGO'],
+                    "chave": API_CONFIG['CHAVE'],
+                    "tipoSaida": "json",
+                    "empresaTrabalho": str(row.cod_empresa),
+                    "codigoSolicitacao": str(row.cod_solicitacao)
+                }
+                
+                # Obter dados desta empresa
+                response = requests.get(
+                    url=API_CONFIG['URL_SOC'] + str(convoca),
+                    timeout=30
+                )
                 data = json.loads(response.content.decode('latin-1'))
                 
-                # Verificar se data é lista ou dicionário
-                if isinstance(data, list):
-                    convocacao_grs_nucleo.extend(data)  # Adicionar todos os itens da lista
-                elif isinstance(data, dict):
-                    convocacao_grs_nucleo.append(data)  # Adicionar o dicionário único
+                # Verificar se data é lista ou dicionário e processar
+                items_to_process = data if isinstance(data, list) else [data]
+                
+                if items_to_process:
+                    # Processar dados diretamente, sem armazenar tudo em memória
+                    process_chunk(items_to_process, summary_data)
                 
                 # Pequena pausa para não sobrecarregar a API
                 time.sleep(0.1)
+                
             except Exception as e:
-                print(f"Erro ao processar empresa {row.cod_empresa}: {e}")
+                print(f"[{datetime.now()}] Erro ao processar empresa {row.cod_empresa}: {e}")
                 continue
         
-        # Normalizar e salvar dados
-        print("Normalizando e salvando dados...")
-        df = pd.json_normalize(convocacao_grs_nucleo)
-        df.to_csv(csv_cache_file, index=False, encoding="utf-8")
-        
-        # Salvar informações do cache
-        with open(cache_info_file, 'w') as f:
-            json.dump({
-                'timestamp': datetime.now().isoformat(),
-                'rows': len(df),
-                'columns': len(df.columns)
-            }, f)
-        
-        print(f"Dados extraídos e salvos com sucesso. Total de {len(df)} registros.")
-        return df
-    
-    except Exception as e:
-        print(f"Erro durante extração de dados: {e}")
-        # Se já existir um cache, usar ele mesmo que esteja expirado
-        if os.path.exists(csv_cache_file):
-            print("Usando cache existente devido a erro na extração.")
-            return pd.read_csv(csv_cache_file, low_memory=False)
-        raise e
-
-# Função para carregar dados (do cache ou da API)
-@server_cache.memoize(timeout=3600)  # Cache por 1 hora
-def load_initial_data():
-    try:
-        # Verificar se cache é válido
-        if is_cache_valid():
-            print("Usando dados em cache...")
-            df = pd.read_csv(csv_cache_file, low_memory=False)
-        else:
-            print("Cache expirado ou inexistente. Extraindo novos dados...")
-            df = extract_data_from_api()
-        
-        # Reportar o tamanho do dataset
-        print(f"Dataset carregado: {len(df)} linhas")
-        
-        # Converter colunas de datas
-        date_columns = ['ULTIMOPEDIDO', 'DATARESULTADO', 'REFAZER']
-        for col in date_columns:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors='coerce')
-        
-        # Criar índice para melhorar performance de filtros
-        if 'NOMEABREVIADO' in df.columns:
-            df['NOMEABREVIADO_ORIGINAL'] = df['NOMEABREVIADO']  # manter original para uso futuro
-            df['NOMEABREVIADO'] = df['NOMEABREVIADO'].astype(str)  # normalizar para string
-
-        # Limpar memória
-        gc.collect()
-        
-        return df
-    
-    except Exception as e:
-        print(f"Erro ao carregar dados: {e}")
-        # Retornar um DataFrame vazio com as colunas necessárias
-        return pd.DataFrame(columns=['CODIGOEMPRESA', 'NOMEABREVIADO', 'EXAME', 'REFAZER'])
-
-# Carregar dados inicialmente
-df_full = load_initial_data()
-
-# Manter uma lista de empresas para o dropdown (mais eficiente que recalcular)
-try:
-    empresas = sorted(list(set(df_full['NOMEABREVIADO'].dropna().unique())))
-    empresas = [e for e in empresas if e and e.strip()]  # Filtrar valores vazios ou só com espaços
-    print(f"Total de empresas: {len(empresas)}")
-except Exception as e:
-    print(f"Erro ao listar empresas: {e}")
-    empresas = []
-
-# Função otimizada para calcular status dos exames
-@server_cache.memoize(timeout=600)  # Cache por 10 minutos
-def process_dataframe(df):
-    today = datetime.now()
-    
-    # Adicionar coluna de dias para vencer (método vetorizado é mais rápido)
-    df['DiasParaVencer'] = (df['REFAZER'] - today).dt.days
-    
-    # Adicionar coluna de status usando numpy (mais rápido que apply)
-    conditions = [
-        df['REFAZER'].isna(),
-        df['DiasParaVencer'] < 0,
-        (df['DiasParaVencer'] >= 0) & (df['DiasParaVencer'] <= 30),
-        (df['DiasParaVencer'] > 30) & (df['DiasParaVencer'] <= 60),
-        (df['DiasParaVencer'] > 60) & (df['DiasParaVencer'] <= 90),
-        df['REFAZER'].dt.year == today.year,
-    ]
-    choices = [
-        'Pendente',
-        'Vencido',
-        'Vence em 30 dias',
-        'Vence em 60 dias',
-        'Vence em 90 dias',
-        'A Vencer (ano atual)'
-    ]
-    df['Status'] = np.select(conditions, choices, default='Em dia')
-    
-    # Adicionar coluna de mês/ano de vencimento (mais eficiente usar strftime diretamente)
-    df['MesAnoVencimento'] = df['REFAZER'].dt.strftime('%Y-%m')
-    
-    return df
-
-# Função otimizada para identificar meses para InCompany
-@server_cache.memoize(timeout=600)  # Cache por 10 minutos
-def identify_incompany_months(df, min_exams=20):
-    # Identificar meses potenciais para InCompany até dezembro de 2025
-    today = datetime.now()
-    end_date = datetime(2025, 12, 31)
-    months = []
-    
-    current = datetime(today.year, today.month, 1)
-    while current <= end_date:
-        months.append(current.strftime('%Y-%m'))
-        current = current + pd.DateOffset(months=1)
-    
-    # Dicionário para armazenar empresas elegíveis por mês
-    incompany_months = {}
-    
-    # Para cada empresa, calcular de forma mais eficiente
-    for empresa in df['NOMEABREVIADO'].unique():
-        if pd.isna(empresa) or not empresa.strip():
-            continue
+        # Salvar resumo agregado (muito menor que dados brutos)
+        with open(SUMMARY_FILE, 'w') as f:
+            json.dump(summary_data, f)
             
-        empresa_df = df[df['NOMEABREVIADO'] == empresa]
+        # Registrar hora da atualização
+        with open(LAST_UPDATE_FILE, 'w') as f:
+            f.write(datetime.now().isoformat())
+            
+        return summary_data
         
-        # Agrupar e contar em uma única operação (muito mais eficiente)
-        month_counts = empresa_df['MesAnoVencimento'].value_counts()
+    except Exception as e:
+        print(f"[{datetime.now()}] Erro durante extração: {e}")
         
-        # Filtrar apenas meses com contagem suficiente
-        eligible_months = []
-        for month in months:
-            count = month_counts.get(month, 0)
-            if count >= min_exams:
-                eligible_months.append({
-                    'month': month,
-                    'count': count
-                })
+        # Se já existir um resumo, usar mesmo que esteja desatualizado
+        if os.path.exists(SUMMARY_FILE):
+            print(f"[{datetime.now()}] Usando resumo existente devido a erro")
+            with open(SUMMARY_FILE, 'r') as f:
+                return json.load(f)
         
-        if eligible_months:
-            incompany_months[empresa] = eligible_months
+        # Se não houver resumo, retornar estrutura vazia
+        return {
+            'status_counts': {},
+            'empresas': [],
+            'exames': [],
+            'meses_vencimento': {},
+            'incompany_eligibility': {},
+            'total_records': 0
+        }
+
+def process_chunk(items, summary_data):
+    """Processa um lote de dados atualizando as estatísticas agregadas"""
+    if not items:
+        return
+        
+    today = datetime.now()
     
-    return incompany_months
+    # Converter para DataFrame temporário (apenas este chunk)
+    chunk_df = pd.json_normalize(items)
+    
+    # Atualizar total de registros
+    summary_data['total_records'] += len(chunk_df)
+    
+    # Processar apenas se tiver colunas relevantes
+    if 'NOMEABREVIADO' in chunk_df.columns:
+        # Adicionar empresas únicas à lista
+        for empresa in chunk_df['NOMEABREVIADO'].dropna().unique():
+            if empresa and empresa not in summary_data['empresas']:
+                summary_data['empresas'].append(empresa)
+    
+    if 'EXAME' in chunk_df.columns:
+        # Adicionar exames únicos à lista
+        for exame in chunk_df['EXAME'].dropna().unique():
+            if exame and exame not in summary_data['exames']:
+                summary_data['exames'].append(exame)
+    
+    # Converter colunas de data
+    date_columns = ['REFAZER', 'ULTIMOPEDIDO', 'DATARESULTADO']
+    for col in date_columns:
+        if col in chunk_df.columns:
+            chunk_df[col] = pd.to_datetime(chunk_df[col], errors='coerce')
+    
+    # Calcular dias para vencer
+    if 'REFAZER' in chunk_df.columns:
+        chunk_df['DiasParaVencer'] = (chunk_df['REFAZER'] - today).dt.days
+        
+        # Calcular status
+        conditions = [
+            chunk_df['REFAZER'].isna(),
+            chunk_df['DiasParaVencer'] < 0,
+            (chunk_df['DiasParaVencer'] >= 0) & (chunk_df['DiasParaVencer'] <= 30),
+            (chunk_df['DiasParaVencer'] > 30) & (chunk_df['DiasParaVencer'] <= 60),
+            (chunk_df['DiasParaVencer'] > 60) & (chunk_df['DiasParaVencer'] <= 90),
+            chunk_df['REFAZER'].dt.year == today.year,
+        ]
+        choices = [
+            'Pendente',
+            'Vencido',
+            'Vence em 30 dias',
+            'Vence em 60 dias',
+            'Vence em 90 dias',
+            'A Vencer (ano atual)'
+        ]
+        chunk_df['Status'] = np.select(conditions, choices, default='Em dia')
+        
+        # Atualizar contagens por status
+        status_counts = chunk_df['Status'].value_counts().to_dict()
+        for status, count in status_counts.items():
+            if status in summary_data['status_counts']:
+                summary_data['status_counts'][status] += count
+            else:
+                summary_data['status_counts'][status] = count
+        
+        # Adicionar coluna de mês/ano de vencimento
+        chunk_df['MesAnoVencimento'] = chunk_df['REFAZER'].dt.strftime('%Y-%m')
+        
+        # Atualizar contagens por mês
+        month_counts = chunk_df['MesAnoVencimento'].value_counts().to_dict()
+        for month, count in month_counts.items():
+            if month and pd.notna(month):
+                if month in summary_data['meses_vencimento']:
+                    summary_data['meses_vencimento'][month] += count
+                else:
+                    summary_data['meses_vencimento'][month] = count
+        
+        # Processar estatísticas de incompany
+        if 'NOMEABREVIADO' in chunk_df.columns:
+            # Para cada empresa neste chunk
+            for empresa in chunk_df['NOMEABREVIADO'].dropna().unique():
+                if not empresa:
+                    continue
+                    
+                # Filtrar apenas para esta empresa
+                empresa_df = chunk_df[chunk_df['NOMEABREVIADO'] == empresa]
+                
+                # Contar por mês
+                empresa_month_counts = empresa_df['MesAnoVencimento'].value_counts().to_dict()
+                
+                # Armazenar meses com 20+ exames (elegíveis para incompany)
+                for month, count in empresa_month_counts.items():
+                    if month and pd.notna(month) and count >= 20:
+                        if empresa not in summary_data['incompany_eligibility']:
+                            summary_data['incompany_eligibility'][empresa] = {}
+                            
+                        if month not in summary_data['incompany_eligibility'][empresa]:
+                            summary_data['incompany_eligibility'][empresa][month] = count
+                        else:
+                            summary_data['incompany_eligibility'][empresa][month] += count
+
+# Verificar se os dados estão atualizados (menos de 24h)
+def is_data_updated():
+    """Verifica se os dados estão atualizados (menos de 24h)"""
+    if not os.path.exists(LAST_UPDATE_FILE):
+        return False
+        
+    try:
+        with open(LAST_UPDATE_FILE, 'r') as f:
+            last_update = datetime.fromisoformat(f.read().strip())
+            
+        hours_since_update = (datetime.now() - last_update).total_seconds() / 3600
+        return hours_since_update < 24
+        
+    except Exception as e:
+        print(f"Erro ao verificar atualização: {e}")
+        return False
+
+# Carregar dados resumidos
+@cache.memoize(timeout=3600)
+def load_data_summary():
+    """Carrega ou atualiza dados resumidos"""
+    if os.path.exists(SUMMARY_FILE) and is_data_updated():
+        # Usar dados em cache
+        with open(SUMMARY_FILE, 'r') as f:
+            return json.load(f)
+    else:
+        # Atualizar dados da API
+        return extract_data_from_api()
+
+# Função otimizada para filtrar estatísticas
+def filter_status_stats(summary_data, empresa, start_date, end_date):
+    """Filtra estatísticas de status com base nos critérios"""
+    # Se não houver dados, retorna vazio
+    if not summary_data or 'status_counts' not in summary_data:
+        return {'Sem dados': 0}
+    
+    # Por enquanto, apenas retorna contagens gerais
+    # Em uma versão mais avançada, podemos implementar filtros mais granulares
+    return summary_data['status_counts']
 
 # Cores para os gráficos
-status_colors = {
+STATUS_COLORS = {
     'Vencido': '#FF5733',
     'Vence em 30 dias': '#FFC300',
     'Vence em 60 dias': '#DAF7A6',
@@ -283,749 +353,564 @@ status_colors = {
     'A Vencer (ano atual)': '#5DADE2',
     'Em dia': '#2ECC71',
     'Pendente': '#BDC3C7',
-    'Desconhecido': '#95A5A6'
+    'Sem dados': '#95A5A6'
 }
 
-# Adicionar informação sobre dados
-data_info = html.Div([
-    html.P([
-        html.Strong("Status dos dados: "), 
-        html.Span(id="data-status", className="text-success"),
-    ], className="mb-1"),
-    html.P([
-        html.Strong("Última atualização: "), 
-        html.Span(id="data-timestamp", className="text-muted"),
-    ], className="mb-1"),
-    html.Button(
-        "Forçar Atualização de Dados", 
-        id="refresh-data-button", 
-        className="btn btn-sm btn-outline-primary mt-2"
-    ),
-    html.Div(id="refresh-status", className="mt-2 small")
-], className="mt-3")
+# Componentes reutilizáveis para minimizar o código
+def create_kpi_card(id_prefix, title, color_class):
+    """Cria um cartão KPI reutilizável"""
+    return html.Div([
+        html.Div([
+            html.H4(id=f'{id_prefix}-count', className=f"text-{color_class}"),
+            html.P(title, className="text-muted small")
+        ], className="border rounded p-2 text-center")
+    ])
 
-# Layout do Dashboard
+# Layout extremamente otimizado
 app.layout = dbc.Container([
+    # Header mínimo
     dbc.Row([
         dbc.Col([
-            html.H1("Dashboard de Gestão de Exames Ocupacionais", 
-                   className="text-center text-primary my-4")
+            html.H2("Dashboard de Exames Ocupacionais", className="text-center text-primary my-3"),
+            html.Div(id="memory-usage", className="text-muted small text-center")
         ])
     ]),
     
+    # Filtros e info
     dbc.Row([
         dbc.Col([
             dbc.Card([
-                dbc.CardHeader("Filtros e Informações", className="bg-primary text-white"),
+                dbc.CardHeader("Filtros e Informações", className="bg-primary text-white py-1"),
                 dbc.CardBody([
+                    # Status dos dados
                     dbc.Row([
                         dbc.Col([
-                            html.Label("Empresa:"),
+                            html.Div([
+                                html.Strong("Status: ", className="small"),
+                                html.Span(id="data-status", className="small")
+                            ], className="mb-1"),
+                            html.Button(
+                                "Atualizar Dados",
+                                id="refresh-button",
+                                className="btn btn-sm btn-outline-primary"
+                            ),
+                        ], width=6),
+                        dbc.Col([
+                            html.Div(id="data-stats", className="small text-muted")
+                        ], width=6)
+                    ], className="mb-2"),
+                    
+                    # Filtros simplificados
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("Empresa:", className="small mb-1"),
                             dcc.Dropdown(
                                 id='empresa-dropdown',
-                                options=[{'label': 'Todas Empresas', 'value': 'todas'}] + 
-                                        [{'label': emp, 'value': emp} for emp in empresas],
+                                options=[{'label': 'Todas Empresas', 'value': 'todas'}],
                                 value='todas',
-                                className="mb-3"
+                                className="mb-2"
                             ),
-                        ], width=8),
-                        dbc.Col([
-                            # Informações sobre os dados
-                            data_info
-                        ], width=4, className="border-left")
+                        ], width=12),
                     ]),
-                    
-                    html.Label("Período:"),
-                    dcc.DatePickerRange(
-                        id='date-range',
-                        start_date=datetime.now().date(),
-                        end_date=datetime(2025, 12, 31).date(),
-                        display_format='DD/MM/YYYY',
-                        className="mb-3"
-                    ),
-                    html.Div(id='data-size-info', className="text-muted small")
-                ])
-            ], className="mb-4")
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("Período:", className="small mb-1"),
+                            dcc.DatePickerRange(
+                                id='date-range',
+                                start_date=datetime.now().date(),
+                                end_date=(datetime.now() + timedelta(days=365)).date(),
+                                display_format='DD/MM/YYYY',
+                                className="mb-2"
+                            ),
+                        ], width=12),
+                    ]),
+                ], className="p-2")  # Padding reduzido
+            ], className="mb-3")
         ])
     ]),
     
-    # Indicador de carregamento para operações demoradas
+    # KPIs principais em cards pequenos
+    dbc.Row([
+        dbc.Col([create_kpi_card("vencidos", "Vencidos", "danger")], width=3),
+        dbc.Col([create_kpi_card("a-vencer", "A Vencer", "warning")], width=3),
+        dbc.Col([create_kpi_card("pendentes", "Pendentes", "info")], width=3),
+        dbc.Col([create_kpi_card("em-dia", "Em Dia", "success")], width=3),
+    ], className="mb-3"),
+    
+    # Gráficos principais - carregados sob demanda
     dcc.Loading(
-        id="loading-1",
+        id="loading-main",
         type="circle",
         children=[
+            # Mostrar contadores e texto em vez de gráficos pesados
             dbc.Row([
                 dbc.Col([
                     dbc.Card([
-                        dbc.CardHeader("Resumo por Status", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            dcc.Graph(id='status-pie-chart')
-                        ])
-                    ], className="mb-4")
+                        dbc.CardHeader("Resumo por Status", className="bg-primary text-white py-1"),
+                        dbc.CardBody(id="status-summary", className="p-2")
+                    ], className="mb-3 h-100")
                 ], width=6),
                 
                 dbc.Col([
                     dbc.Card([
-                        dbc.CardHeader("KPIs", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            dbc.Row([
-                                dbc.Col([
-                                    html.Div([
-                                        html.H4(id='vencidos-count', className="text-danger"),
-                                        html.P("Exames Vencidos", className="text-muted")
-                                    ], className="border rounded p-3 text-center")
-                                ], width=6),
-                                dbc.Col([
-                                    html.Div([
-                                        html.H4(id='a-vencer-count', className="text-warning"),
-                                        html.P("Exames a Vencer (90 dias)", className="text-muted")
-                                    ], className="border rounded p-3 text-center")
-                                ], width=6)
-                            ], className="mb-3"),
-                            dbc.Row([
-                                dbc.Col([
-                                    html.Div([
-                                        html.H4(id='pendentes-count', className="text-info"),
-                                        html.P("Exames Pendentes", className="text-muted")
-                                    ], className="border rounded p-3 text-center")
-                                ], width=6),
-                                dbc.Col([
-                                    html.Div([
-                                        html.H4(id='em-dia-count', className="text-success"),
-                                        html.P("Exames em Dia", className="text-muted")
-                                    ], className="border rounded p-3 text-center")
-                                ], width=6)
-                            ])
-                        ])
-                    ], className="mb-4")
+                        dbc.CardHeader("Vencimentos próximos 6 meses", className="bg-primary text-white py-1"),
+                        dbc.CardBody(id="vencimentos-proximos", className="p-2")
+                    ], className="mb-3 h-100")
                 ], width=6)
             ]),
             
+            # Mostrar tabela em vez de gráfico para InCompany (mais leve)
             dbc.Row([
                 dbc.Col([
                     dbc.Card([
-                        dbc.CardHeader("Vencimentos por Mês", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            dcc.Graph(id='vencimentos-bar-chart')
-                        ])
-                    ], className="mb-4")
-                ])
+                        dbc.CardHeader("Elegibilidade para InCompany", className="bg-primary text-white py-1"),
+                        dbc.CardBody(id="incompany-table", className="p-2")
+                    ], className="mb-3")
+                ], width=12)
             ]),
             
+            # Recomendações e ações
             dbc.Row([
                 dbc.Col([
                     dbc.Card([
-                        dbc.CardHeader("Meses Elegíveis para InCompany", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            html.Div(id='incompany-months-table')
-                        ])
-                    ], className="mb-4")
-                ], width=8),
-                
-                dbc.Col([
-                    dbc.Card([
-                        dbc.CardHeader("Análise de Criticidade", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            html.Div(id='criticality-gauge')
-                        ])
-                    ], className="mb-4")
-                ], width=4)
-            ]),
-            
-            dbc.Row([
-                dbc.Col([
-                    dbc.Card([
-                        dbc.CardHeader("Análise por Tipo de Exame", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            dcc.Graph(id='exames-bar-chart')
-                        ])
-                    ], className="mb-4")
-                ])
-            ]),
-            
-            dbc.Row([
-                dbc.Col([
-                    dbc.Card([
-                        dbc.CardHeader("Ações Estratégicas Recomendadas", className="bg-primary text-white"),
-                        dbc.CardBody([
-                            html.Div(id='estrategias-recomendadas')
-                        ])
-                    ], className="mb-4")
-                ])
+                        dbc.CardHeader("Ações Recomendadas", className="bg-primary text-white py-1"),
+                        dbc.CardBody(id="acoes-recomendadas", className="p-2")
+                    ], className="mb-3")
+                ], width=12)
             ])
         ]
     ),
     
+    # Footer mínimo
     dbc.Row([
         dbc.Col([
             html.Footer([
-                html.P("Dashboard de Gestão de Exames Ocupacionais | Dados atualizados em: " + 
-                      datetime.now().strftime("%d/%m/%Y %H:%M"),
-                      className="text-center text-muted")
+                html.P("Dashboard v2.0 - Otimizado para baixo consumo de memória", className="text-center text-muted small")
             ])
         ])
-    ])
+    ]),
+    
+    # Intervalo para atualizar uso de memória
+    dcc.Interval(
+        id='memory-interval',
+        interval=10000,  # 10 segundos
+        n_intervals=0
+    ),
+    
+    # Armazenar dados do último refresh para evitar recargas
+    dcc.Store(id='refresh-timestamp'),
+    
+    # Armazenar último status de memória
+    dcc.Store(id='last-memory-usage', data=0),
     
 ], fluid=True)
 
-# Função para obter informações do cache
-def get_cache_info():
-    try:
-        if os.path.exists(cache_info_file):
-            with open(cache_info_file, 'r') as f:
-                return json.load(f)
-        return None
-    except Exception as e:
-        print(f"Erro ao ler informações do cache: {e}")
-        return None
-
-# Callback para mostrar informações do cache
+# Callback para mostrar uso de memória
 @app.callback(
-    [Output("data-status", "children"),
-     Output("data-timestamp", "children")],
-    [Input("refresh-data-button", "n_clicks")]
+    Output('memory-usage', 'children'),
+    Input('memory-interval', 'n_intervals'),
+    Input('last-memory-usage', 'data')
 )
-def update_data_info(n_clicks):
-    cache_info = get_cache_info()
-    
-    if cache_info:
-        timestamp = datetime.fromisoformat(cache_info['timestamp'])
-        formatted_time = timestamp.strftime("%d/%m/%Y %H:%M:%S")
-        
-        if is_cache_valid():
-            status = "Atualizado"
-            return status, formatted_time
-        else:
-            status = "Desatualizado (>24h)"
-            return status, formatted_time
-    
-    return "Não disponível", "Nunca atualizado"
+def update_memory_usage(n, last_usage):
+    usage = get_memory_usage()
+    return usage
 
-# Callback para atualizar dados quando solicitado
+# Callback para atualizar dropdown de empresas
 @app.callback(
-    Output("refresh-status", "children"),
-    [Input("refresh-data-button", "n_clicks")]
+    Output('empresa-dropdown', 'options'),
+    Input('refresh-button', 'n_clicks')
+)
+def update_dropdown(n_clicks):
+    # Carregar dados resumidos
+    summary_data = load_data_summary()
+    
+    # Lista base de opções
+    options = [{'label': 'Todas Empresas', 'value': 'todas'}]
+    
+    # Adicionar empresas do resumo
+    if summary_data and 'empresas' in summary_data:
+        # Verificar tipo para lidar com dicionários ou listas
+        if isinstance(summary_data['empresas'], dict):
+            empresas = list(summary_data['empresas'].keys())
+        else:
+            empresas = summary_data['empresas']
+            
+        # Adicionar cada empresa como opção
+        for empresa in sorted(empresas):
+            if empresa and empresa.strip():
+                options.append({'label': empresa, 'value': empresa})
+    
+    return options
+
+# Callback para mostrar status dos dados
+@app.callback(
+    [Output('data-status', 'children'),
+     Output('data-status', 'className'),
+     Output('data-stats', 'children')],
+    [Input('refresh-button', 'n_clicks'),
+     Input('memory-interval', 'n_intervals')]
+)
+def update_data_status(n_clicks, n_intervals):
+    # Verificar se dados estão atualizados
+    is_updated = is_data_updated()
+    
+    # Obter estatísticas
+    stats_text = ""
+    if os.path.exists(SUMMARY_FILE):
+        try:
+            with open(SUMMARY_FILE, 'r') as f:
+                summary = json.load(f)
+                stats_text = f"Total de registros: {summary.get('total_records', 0):,} | " + \
+                             f"Empresas: {len(summary.get('empresas', []))} | " + \
+                             f"Exames: {len(summary.get('exames', []))}"
+        except:
+            stats_text = "Estatísticas não disponíveis"
+    
+    # Obter data da última atualização
+    last_update = "Nunca"
+    if os.path.exists(LAST_UPDATE_FILE):
+        try:
+            with open(LAST_UPDATE_FILE, 'r') as f:
+                last_update = datetime.fromisoformat(f.read().strip()).strftime("%d/%m/%Y %H:%M")
+        except:
+            pass
+    
+    if is_updated:
+        return f"Atualizado em {last_update}", "small text-success", stats_text
+    else:
+        return f"Desatualizado (>24h) - Última: {last_update}", "small text-warning", stats_text
+
+# Callback para atualizar dados
+@app.callback(
+    Output('refresh-timestamp', 'data'),
+    Input('refresh-button', 'n_clicks')
 )
 def refresh_data(n_clicks):
-    if n_clicks is None or n_clicks == 0:
-        return ""
-    
-    try:
-        # Forçar atualização de dados
-        extract_data_from_api()
+    if n_clicks:
+        # Limpar caches
+        cache.clear()
         
-        # Limpar cache de função
-        server_cache.clear()
+        # Recarregar dados (isso atualizará da API se necessário)
+        summary_data = load_data_summary()
         
-        # Recarregar dados
-        global df_full, df_processed
-        df_full = load_initial_data()
-        if 'df_processed' in globals():
-            del df_processed
+        # Forçar coleta de lixo
+        clear_memory()
         
-        return html.Span("Dados atualizados com sucesso! Recarregue a página para ver as mudanças.", 
-                         className="text-success")
-    except Exception as e:
-        return html.Span(f"Erro ao atualizar dados: {str(e)}", className="text-danger")
+        return datetime.now().isoformat()
+    
+    return datetime.now().isoformat()
 
-# Função otimizada para filtrar dados
-@server_cache.memoize(timeout=300)  # Cache por 5 minutos
-def filter_dataframe(empresa, start_date, end_date):
-    # Converter parâmetros para formatos adequados
-    start_date = pd.to_datetime(start_date)
-    end_date = pd.to_datetime(end_date)
-    
-    # Processar dados iniciais apenas uma vez e armazenar em cache
-    global df_processed
-    if 'df_processed' not in globals():
-        print("Processando dataframe pela primeira vez...")
-        df_processed = process_dataframe(df_full.copy())
-    
-    # Filtrar por empresa (mais eficiente usando índice)
-    if empresa != 'todas':
-        filtered_df = df_processed[df_processed['NOMEABREVIADO'] == empresa].copy()
-    else:
-        filtered_df = df_processed.copy()
-    
-    # Filtrar por período (com base na data REFAZER)
-    date_mask = (filtered_df['REFAZER'].isna()) | (
-        (filtered_df['REFAZER'] >= start_date) & (filtered_df['REFAZER'] <= end_date)
-    )
-    filtered_df = filtered_df[date_mask]
-    
-    # Forçar limpeza de memória para DataFrames temporários
-    gc.collect()
-    
-    return filtered_df
-
-# Callbacks mais eficientes
+# Callback para atualizar KPIs
 @app.callback(
-    Output('data-size-info', 'children'),
-    [Input('empresa-dropdown', 'value')]
+    [Output('vencidos-count', 'children'),
+     Output('a-vencer-count', 'children'),
+     Output('pendentes-count', 'children'),
+     Output('em-dia-count', 'children')],
+    [Input('empresa-dropdown', 'value'),
+     Input('date-range', 'start_date'),
+     Input('date-range', 'end_date'),
+     Input('refresh-timestamp', 'data')]
 )
-def update_data_info(selected_empresa):
-    if selected_empresa == 'todas':
-        return f"Total de registros: {len(df_full):,}"
-    else:
-        count = len(df_full[df_full['NOMEABREVIADO'] == selected_empresa])
-        return f"Registros para {selected_empresa}: {count:,}"
+def update_kpis(empresa, start_date, end_date, refresh_time):
+    # Carregar dados resumidos
+    summary_data = load_data_summary()
+    
+    # Filtrar estatísticas
+    status_counts = filter_status_stats(summary_data, empresa, start_date, end_date)
+    
+    # Calcular valores dos KPIs
+    vencidos = status_counts.get('Vencido', 0)
+    
+    a_vencer = status_counts.get('Vence em 30 dias', 0) + \
+               status_counts.get('Vence em 60 dias', 0) + \
+               status_counts.get('Vence em 90 dias', 0) + \
+               status_counts.get('A Vencer (ano atual)', 0)
+               
+    pendentes = status_counts.get('Pendente', 0)
+    
+    em_dia = status_counts.get('Em dia', 0)
+    
+    return f"{vencidos:,}", f"{a_vencer:,}", f"{pendentes:,}", f"{em_dia:,}"
 
-# Usamos múltiplos callbacks em vez de um grande para melhor desempenho
+# Callback para mostrar resumo por status
 @app.callback(
-    [
-        Output('status-pie-chart', 'figure'),
-        Output('vencidos-count', 'children'),
-        Output('a-vencer-count', 'children'),
-        Output('pendentes-count', 'children'),
-        Output('em-dia-count', 'children')
-    ],
-    [
-        Input('empresa-dropdown', 'value'),
-        Input('date-range', 'start_date'),
-        Input('date-range', 'end_date')
-    ]
+    Output('status-summary', 'children'),
+    [Input('empresa-dropdown', 'value'),
+     Input('date-range', 'start_date'),
+     Input('date-range', 'end_date'),
+     Input('refresh-timestamp', 'data')]
 )
-def update_kpis_and_status(selected_empresa, start_date, end_date):
-    # Filtrar dados
-    filtered_df = filter_dataframe(selected_empresa, start_date, end_date)
+def update_status_summary(empresa, start_date, end_date, refresh_time):
+    # Carregar dados resumidos
+    summary_data = load_data_summary()
     
-    # Calcular contagens por status (usando value_counts é mais rápido)
-    status_counts = filtered_df['Status'].value_counts().reset_index()
-    status_counts.columns = ['Status', 'Count']
+    # Filtrar estatísticas
+    status_counts = filter_status_stats(summary_data, empresa, start_date, end_date)
     
-    # Limitar a 1000 registros para o gráfico de pizza para performance
-    if len(status_counts) > 0:
-        # Criar gráfico de pizza
-        pie_chart = px.pie(
-            status_counts, 
-            values='Count', 
-            names='Status',
-            color='Status',
-            color_discrete_map=status_colors,
-            title='Distribuição de Exames por Status',
-            hole=0.4
-        )
-        pie_chart.update_traces(textinfo='percent+label')
-    else:
-        # Gráfico vazio se não há dados
-        pie_chart = px.pie(
-            pd.DataFrame({'Status': ['Sem dados'], 'Count': [1]}),
-            values='Count',
-            names='Status',
-            title='Sem dados para exibir'
-        )
+    # Criar tabela de resumo
+    if not status_counts:
+        return html.P("Sem dados disponíveis", className="text-muted")
     
-    # Calcular contagens para KPIs
-    vencidos = filtered_df[filtered_df['Status'] == 'Vencido'].shape[0]
-    a_vencer_90 = filtered_df[
-        (filtered_df['Status'] == 'Vence em 30 dias') |
-        (filtered_df['Status'] == 'Vence em 60 dias') |
-        (filtered_df['Status'] == 'Vence em 90 dias')
-    ].shape[0]
-    pendentes = filtered_df[filtered_df['Status'] == 'Pendente'].shape[0]
-    em_dia = filtered_df[
-        (filtered_df['Status'] == 'Em dia') | 
-        (filtered_df['Status'] == 'A Vencer (ano atual)')
-    ].shape[0]
+    # Tabela simples em vez de gráfico (mais leve)
+    rows = []
+    for status, count in sorted(status_counts.items(), key=lambda x: x[1], reverse=True):
+        if count > 0:
+            # Determinar cor do status
+            color = STATUS_COLORS.get(status, '#777777')
+            
+            # Criar linha da tabela
+            rows.append(html.Tr([
+                html.Td(html.Div(className="color-dot", style={"backgroundColor": color})),
+                html.Td(status),
+                html.Td(f"{count:,}", className="text-right"),
+            ]))
     
-    return pie_chart, f"{vencidos:,}", f"{a_vencer_90:,}", f"{pendentes:,}", f"{em_dia:,}"
+    # Montar tabela completa
+    table = html.Table([
+        html.Thead(html.Tr([
+            html.Th("", style={"width": "20px"}),
+            html.Th("Status"),
+            html.Th("Quantidade", className="text-right"),
+        ])),
+        html.Tbody(rows)
+    ], className="table table-sm")
+    
+    return table
 
+# Callback para mostrar vencimentos próximos
 @app.callback(
-    Output('vencimentos-bar-chart', 'figure'),
-    [
-        Input('empresa-dropdown', 'value'),
-        Input('date-range', 'start_date'),
-        Input('date-range', 'end_date')
-    ]
+    Output('vencimentos-proximos', 'children'),
+    [Input('empresa-dropdown', 'value'),
+     Input('date-range', 'start_date'),
+     Input('date-range', 'end_date'),
+     Input('refresh-timestamp', 'data')]
 )
-def update_vencimentos_chart(selected_empresa, start_date, end_date):
-    # Filtrar dados
-    filtered_df = filter_dataframe(selected_empresa, start_date, end_date)
+def update_vencimentos_proximos(empresa, start_date, end_date, refresh_time):
+    # Carregar dados resumidos
+    summary_data = load_data_summary()
     
-    # Agrupar por mês/ano de vencimento (usar value_counts é mais eficiente)
-    vencimentos_por_mes = filtered_df.dropna(subset=['MesAnoVencimento'])['MesAnoVencimento'].value_counts().reset_index()
-    vencimentos_por_mes.columns = ['MesAno', 'Count']
-    vencimentos_por_mes = vencimentos_por_mes.sort_values('MesAno')
+    # Se não houver dados, mostra mensagem
+    if not summary_data or 'meses_vencimento' not in summary_data:
+        return html.P("Sem dados disponíveis", className="text-muted")
     
-    # Converter para formato mais legível
-    vencimentos_por_mes['MesAnoFormatado'] = vencimentos_por_mes['MesAno'].apply(
-        lambda x: pd.to_datetime(x).strftime('%b/%Y')
-    )
-    
-    # Filtrar para mostrar apenas os próximos 12 meses
+    # Gerar sequência dos próximos 6 meses
     today = datetime.now()
-    next_12_months = [(today + pd.DateOffset(months=i)).strftime('%Y-%m') for i in range(12)]
-    vencimentos_por_mes = vencimentos_por_mes[vencimentos_por_mes['MesAno'].isin(next_12_months)]
+    next_months = [(today + timedelta(days=30*i)).strftime('%Y-%m') for i in range(6)]
     
-    # Limitar a 12 meses para melhor visualização
-    vencimentos_por_mes = vencimentos_por_mes.head(12)
+    # Filtrar apenas os próximos 6 meses
+    month_counts = {
+        month: summary_data['meses_vencimento'].get(month, 0)
+        for month in next_months
+    }
     
-    # Criar gráfico de barras
-    if len(vencimentos_por_mes) > 0:
-        bar_chart = px.bar(
-            vencimentos_por_mes,
-            x='MesAnoFormatado',
-            y='Count',
-            title='Vencimentos por Mês (Próximos 12 Meses)',
-            labels={'Count': 'Qtde Exames', 'MesAnoFormatado': 'Mês/Ano'},
-            color_discrete_sequence=['#3498DB']
-        )
-    else:
-        # Gráfico vazio se não há dados
-        bar_chart = px.bar(
-            pd.DataFrame({'Mês': ['Sem dados'], 'Count': [0]}),
-            x='Mês',
-            y='Count',
-            title='Sem dados para exibir'
-        )
+    # Criar tabela de resumo
+    rows = []
+    for month, count in month_counts.items():
+        # Formatar mês para exibição
+        month_date = datetime.strptime(month, '%Y-%m')
+        month_formatted = month_date.strftime('%b/%Y')
+        
+        # Determinar status do mês
+        bgcolor = "#ffffff"
+        if count > 50:
+            bgcolor = "#ffeeee"  # Vermelho claro para meses com muitos vencimentos
+        
+        # Criar linha da tabela
+        rows.append(html.Tr([
+            html.Td(month_formatted),
+            html.Td(f"{count:,}", className="text-right"),
+        ], style={"backgroundColor": bgcolor}))
     
-    return bar_chart
+    # Montar tabela completa
+    table = html.Table([
+        html.Thead(html.Tr([
+            html.Th("Mês"),
+            html.Th("Qtde Exames", className="text-right"),
+        ])),
+        html.Tbody(rows)
+    ], className="table table-sm")
+    
+    return table
 
+# Callback para tabela de incompany
 @app.callback(
-    Output('exames-bar-chart', 'figure'),
-    [
-        Input('empresa-dropdown', 'value'),
-        Input('date-range', 'start_date'),
-        Input('date-range', 'end_date')
-    ]
+    Output('incompany-table', 'children'),
+    [Input('empresa-dropdown', 'value'),
+     Input('date-range', 'start_date'),
+     Input('date-range', 'end_date'),
+     Input('refresh-timestamp', 'data')]
 )
-def update_exames_chart(selected_empresa, start_date, end_date):
-    # Filtrar dados
-    filtered_df = filter_dataframe(selected_empresa, start_date, end_date)
+def update_incompany_table(empresa, start_date, end_date, refresh_time):
+    # Carregar dados resumidos
+    summary_data = load_data_summary()
     
-    # Agrupar por tipo de exame e status
-    try:
-        exames_status = filtered_df.groupby(['EXAME', 'Status']).size().reset_index(name='Count')
-        
-        # Limitar a 15 tipos de exames mais comuns para melhor visualização
-        top_exames = filtered_df['EXAME'].value_counts().nlargest(15).index.tolist()
-        exames_status = exames_status[exames_status['EXAME'].isin(top_exames)]
-        
-        # Criar gráfico de barras
-        if len(exames_status) > 0:
-            exames_chart = px.bar(
-                exames_status,
-                x='EXAME',
-                y='Count',
-                color='Status',
-                title='Top 15 Tipos de Exame por Status',
-                color_discrete_map=status_colors,
-                labels={'Count': 'Qtde', 'EXAME': 'Tipo de Exame'},
-                height=500
-            )
-            exames_chart.update_layout(xaxis={'categoryorder':'total descending'})
-        else:
-            # Gráfico vazio se não há dados
-            exames_chart = px.bar(
-                pd.DataFrame({'Exame': ['Sem dados'], 'Count': [0]}),
-                x='Exame',
-                y='Count',
-                title='Sem dados para exibir'
-            )
-    except Exception as e:
-        print(f"Erro ao criar gráfico de exames: {e}")
-        # Gráfico vazio em caso de erro
-        exames_chart = px.bar(
-            pd.DataFrame({'Exame': ['Erro ao processar dados'], 'Count': [0]}),
-            x='Exame',
-            y='Count',
-            title='Erro ao processar dados'
-        )
+    # Se não houver dados, mostra mensagem
+    if not summary_data or 'incompany_eligibility' not in summary_data:
+        return html.P("Sem dados disponíveis", className="text-muted")
     
-    return exames_chart
-
-@app.callback(
-    [
-        Output('incompany-months-table', 'children'),
-        Output('criticality-gauge', 'children'),
-        Output('estrategias-recomendadas', 'children')
-    ],
-    [
-        Input('empresa-dropdown', 'value'),
-        Input('date-range', 'start_date'),
-        Input('date-range', 'end_date')
-    ]
-)
-def update_analysis_components(selected_empresa, start_date, end_date):
-    # Filtrar dados
-    filtered_df = filter_dataframe(selected_empresa, start_date, end_date)
+    incompany_data = summary_data['incompany_eligibility']
     
-    # Calcular incompany para conjunto filtrado
-    incompany_months = identify_incompany_months(filtered_df)
-    
-    # 1. Tabela de meses elegíveis para InCompany
-    if selected_empresa != 'todas' and selected_empresa in incompany_months:
-        incompany_data = incompany_months[selected_empresa]
+    # Se for empresa específica
+    if empresa != 'todas' and empresa in incompany_data:
+        # Mostrar dados apenas para esta empresa
+        months_data = incompany_data[empresa]
         
-        # Converter para formato mais legível
-        for item in incompany_data:
-            item['month_formatted'] = pd.to_datetime(item['month']).strftime('%b/%Y')
+        if not months_data:
+            return html.P(f"Empresa {empresa} não possui meses elegíveis para InCompany", className="text-muted")
         
-        # Filtrar para meses dentro do período selecionado
-        start_date_dt = pd.to_datetime(start_date)
-        end_date_dt = pd.to_datetime(end_date)
-        incompany_data = [
-            item for item in incompany_data 
-            if start_date_dt <= pd.to_datetime(item['month']) <= end_date_dt
+        # Criar tabela de resumo
+        rows = []
+        for month, count in sorted(months_data.items()):
+            # Formatar mês para exibição
+            try:
+                month_date = datetime.strptime(month, '%Y-%m')
+                month_formatted = month_date.strftime('%b/%Y')
+            except:
+                month_formatted = month
+            
+            # Criar linha da tabela
+            rows.append(html.Tr([
+                html.Td(month_formatted),
+                html.Td(f"{count:,}", className="text-right"),
+                html.Td("Elegível" if count >= 20 else "Não elegível", 
+                       className="text-success" if count >= 20 else "text-muted"),
+            ]))
+        
+        # Montar tabela completa
+        table = html.Table([
+            html.Thead(html.Tr([
+                html.Th("Mês"),
+                html.Th("Qtde Exames", className="text-right"),
+                html.Th("Status"),
+            ])),
+            html.Tbody(rows)
+        ], className="table table-sm")
+        
+        return [
+            html.H6(f"Elegibilidade para InCompany - {empresa}"),
+            table
         ]
-        
-        if incompany_data:
-            incompany_table = dash_table.DataTable(
-                columns=[
-                    {'name': 'Mês', 'id': 'month_formatted'},
-                    {'name': 'Quantidade de Exames', 'id': 'count'}
-                ],
-                data=incompany_data,
-                style_header={
-                    'backgroundColor': '#f8f9fa',
-                    'fontWeight': 'bold'
-                },
-                style_cell={
-                    'textAlign': 'center',
-                    'padding': '10px'
-                },
-                style_data_conditional=[
-                    {
-                        'if': {'row_index': 'odd'},
-                        'backgroundColor': '#f2f2f2'
-                    },
-                    {
-                        'if': {'column_id': 'count', 'filter_query': '{count} >= 20'},
-                        'backgroundColor': '#d4edda',
-                        'color': '#155724'
-                    }
-                ]
-            )
-            
-            incompany_content = [
-                html.H5(f"Meses Elegíveis para InCompany - {selected_empresa}"),
-                incompany_table,
-                html.P("Meses com 20 ou mais exames são elegíveis para InCompany.", 
-                       className="mt-3 text-muted")
-            ]
-        else:
-            incompany_content = [
-                html.H5(f"Meses Elegíveis para InCompany - {selected_empresa}"),
-                html.P("Não há meses elegíveis para InCompany no período selecionado.",
-                      className="text-muted")
-            ]
     else:
-        if selected_empresa == 'todas':
-            # Compilar todos os meses elegíveis por empresa (limite a 100 para performance)
-            all_incompany = []
-            count = 0
-            for empresa, months in incompany_months.items():
-                for month_data in months:
-                    # Converter para formato mais legível
-                    month_formatted = pd.to_datetime(month_data['month']).strftime('%b/%Y')
-                    # Filtrar para meses dentro do período selecionado
-                    start_date_dt = pd.to_datetime(start_date)
-                    end_date_dt = pd.to_datetime(end_date)
-                    if start_date_dt <= pd.to_datetime(month_data['month']) <= end_date_dt:
-                        all_incompany.append({
-                            'empresa': empresa,
-                            'month': month_data['month'],
-                            'month_formatted': month_formatted,
-                            'count': month_data['count']
-                        })
-                        count += 1
-                        if count >= 100:  # Limitar a 100 registros para performance
-                            break
-                if count >= 100:
-                    break
-            
-            if all_incompany:
-                incompany_table = dash_table.DataTable(
-                    columns=[
-                        {'name': 'Empresa', 'id': 'empresa'},
-                        {'name': 'Mês', 'id': 'month_formatted'},
-                        {'name': 'Quantidade de Exames', 'id': 'count'}
-                    ],
-                    data=all_incompany,
-                    style_header={
-                        'backgroundColor': '#f8f9fa',
-                        'fontWeight': 'bold'
-                    },
-                    style_cell={
-                        'textAlign': 'center',
-                        'padding': '10px'
-                    },
-                    style_data_conditional=[
-                        {
-                            'if': {'row_index': 'odd'},
-                            'backgroundColor': '#f2f2f2'
-                        },
-                        {
-                            'if': {'column_id': 'count', 'filter_query': '{count} >= 20'},
-                            'backgroundColor': '#d4edda',
-                            'color': '#155724'
-                        }
-                    ],
-                    sort_action='native',
-                    filter_action='native',
-                    page_size=10
-                )
-                
-                incompany_content = [
-                    html.H5("Meses Elegíveis para InCompany - Todas Empresas"),
-                    incompany_table,
-                    html.P("Meses com 20 ou mais exames são elegíveis para InCompany.", 
-                           className="mt-3 text-muted")
-                ]
-            else:
-                incompany_content = [
-                    html.H5("Meses Elegíveis para InCompany - Todas Empresas"),
-                    html.P("Não há meses elegíveis para InCompany no período selecionado.",
-                          className="text-muted")
-                ]
-        else:
-            incompany_content = [
-                html.H5("Meses Elegíveis para InCompany"),
-                html.P("Selecione uma empresa para ver os meses elegíveis para InCompany.",
-                      className="text-muted")
-            ]
+        # Mostrar dados agregados para todas as empresas
+        # Limitado a 10 empresas para economizar espaço/memória
+        eligible_count = 0
+        top_companies = []
+        
+        for company, months in incompany_data.items():
+            eligible_months = sum(1 for count in months.values() if count >= 20)
+            if eligible_months > 0:
+                eligible_count += 1
+                top_companies.append((company, eligible_months, sum(months.values())))
+        
+        # Ordenar por número de meses elegíveis
+        top_companies.sort(key=lambda x: x[1], reverse=True)
+        
+        # Limitar a 10 empresas
+        top_companies = top_companies[:10]
+        
+        # Criação da tabela resumo
+        if not top_companies:
+            return html.P("Não há empresas elegíveis para InCompany no período", className="text-muted")
+        
+        # Criar tabela de resumo
+        rows = []
+        for company, eligible_months, total_exams in top_companies:
+            rows.append(html.Tr([
+                html.Td(company),
+                html.Td(f"{eligible_months}", className="text-right"),
+                html.Td(f"{total_exams:,}", className="text-right"),
+            ]))
+        
+        # Montar tabela completa
+        table = html.Table([
+            html.Thead(html.Tr([
+                html.Th("Empresa"),
+                html.Th("Meses Elegíveis", className="text-right"),
+                html.Th("Total Exames", className="text-right"),
+            ])),
+            html.Tbody(rows)
+        ], className="table table-sm")
+        
+        return [
+            html.H6(f"Top 10 Empresas Elegíveis para InCompany (de {eligible_count} total)"),
+            html.P("Selecione uma empresa específica para ver detalhes", className="text-muted small mb-2"),
+            table
+        ]
+
+# Callback para mostrar ações recomendadas
+@app.callback(
+    Output('acoes-recomendadas', 'children'),
+    [Input('empresa-dropdown', 'value'),
+     Input('date-range', 'start_date'),
+     Input('date-range', 'end_date'),
+     Input('refresh-timestamp', 'data')]
+)
+def update_acoes_recomendadas(empresa, start_date, end_date, refresh_time):
+    # Carregar dados resumidos
+    summary_data = load_data_summary()
     
-    # 2. Medidor de criticidade
-    total_exames = filtered_df.shape[0]
-    if total_exames > 0:
-        # Calcular contagens por status
-        vencidos = filtered_df[filtered_df['Status'] == 'Vencido'].shape[0]
-        a_vencer_90 = filtered_df[
-            (filtered_df['Status'] == 'Vence em 30 dias') |
-            (filtered_df['Status'] == 'Vence em 60 dias') |
-            (filtered_df['Status'] == 'Vence em 90 dias')
-        ].shape[0]
-        pendentes = filtered_df[filtered_df['Status'] == 'Pendente'].shape[0]
-        
-        percentual_vencidos = (vencidos / total_exames) * 100
-        percentual_a_vencer = (a_vencer_90 / total_exames) * 100
-        percentual_pendentes = (pendentes / total_exames) * 100
-        
-        criticality_score = percentual_vencidos * 1 + percentual_a_vencer * 0.5 + percentual_pendentes * 0.3
-        
-        # Gauge para nível de criticidade
-        gauge_fig = go.Figure(go.Indicator(
-            mode = "gauge+number",
-            value = criticality_score,
-            domain = {'x': [0, 1], 'y': [0, 1]},
-            title = {'text': "Nível de Criticidade", 'font': {'size': 16}},
-            gauge = {
-                'axis': {'range': [None, 100], 'tickwidth': 1, 'tickcolor': "darkblue"},
-                'bar': {'color': "darkblue"},
-                'bgcolor': "white",
-                'borderwidth': 2,
-                'bordercolor': "gray",
-                'steps': [
-                    {'range': [0, 20], 'color': 'green'},
-                    {'range': [20, 40], 'color': 'lime'},
-                    {'range': [40, 60], 'color': 'yellow'},
-                    {'range': [60, 80], 'color': 'orange'},
-                    {'range': [80, 100], 'color': 'red'}
-                ],
-                'threshold': {
-                    'line': {'color': "red", 'width': 4},
-                    'thickness': 0.75,
-                    'value': 80
-                }
-            }
-        ))
-        
-        gauge_fig.update_layout(height=300, margin=dict(l=10, r=10, t=50, b=10))
-        
-        criticality_content = dcc.Graph(figure=gauge_fig)
-    else:
-        criticality_content = html.P("Sem dados para calcular criticidade.", className="text-muted")
+    # Filtrar estatísticas
+    status_counts = filter_status_stats(summary_data, empresa, start_date, end_date)
     
-    # 3. Recomendações estratégicas
-    if total_exames > 0:
-        # Calcular contagens por status
-        vencidos = filtered_df[filtered_df['Status'] == 'Vencido'].shape[0]
-        a_vencer_90 = filtered_df[
-            (filtered_df['Status'] == 'Vence em 30 dias') |
-            (filtered_df['Status'] == 'Vence em 60 dias') |
-            (filtered_df['Status'] == 'Vence em 90 dias')
-        ].shape[0]
-        pendentes = filtered_df[filtered_df['Status'] == 'Pendente'].shape[0]
-        
-        recomendacoes = []
-        
-        if vencidos > 0:
-            recomendacoes.append(html.Li([
-                html.Span("Ação Imediata: ", className="font-weight-bold text-danger"),
-                f"Regularizar os {vencidos:,} exames vencidos com prioridade."
-            ]))
-        
-        if pendentes > 0:
-            recomendacoes.append(html.Li([
-                html.Span("Curto Prazo (30 dias): ", className="font-weight-bold text-warning"),
-                f"Definir datas para os {pendentes:,} exames pendentes que não possuem programação."
-            ]))
-        
-        if a_vencer_90 > 0:
-            recomendacoes.append(html.Li([
-                html.Span("Médio Prazo (90 dias): ", className="font-weight-bold text-info"),
-                f"Planejar a realização dos {a_vencer_90:,} exames que vencem nos próximos 90 dias."
-            ]))
-        
-        # Verificar se há meses com muitos vencimentos para recomendar InCompany
-        if selected_empresa != 'todas' and selected_empresa in incompany_months:
-            incompany_data = incompany_months[selected_empresa]
-            
-            # Filtrar para meses dentro do período selecionado
-            start_date_dt = pd.to_datetime(start_date)
-            end_date_dt = pd.to_datetime(end_date)
-            incompany_data = [
-                item for item in incompany_data 
-                if start_date_dt <= pd.to_datetime(item['month']) <= end_date_dt
-            ]
-            
-            if incompany_data:
-                next_incompany = sorted(incompany_data, key=lambda x: pd.to_datetime(x['month']))[0]
-                month_formatted = pd.to_datetime(next_incompany['month']).strftime('%b/%Y')
-                
-                recomendacoes.append(html.Li([
-                    html.Span("Planejamento InCompany: ", className="font-weight-bold text-primary"),
-                    f"Programar InCompany para {month_formatted} com {next_incompany['count']:,} exames previstos."
-                ]))
-        
-        # Adicionar recomendação contínua
+    # Calcular valores dos KPIs
+    vencidos = status_counts.get('Vencido', 0)
+    a_vencer_30 = status_counts.get('Vence em 30 dias', 0)
+    a_vencer_60 = status_counts.get('Vence em 60 dias', 0)
+    a_vencer_90 = status_counts.get('Vence em 90 dias', 0)
+    pendentes = status_counts.get('Pendente', 0)
+    
+    # Lista de recomendações
+    recomendacoes = []
+    
+    if vencidos > 0:
         recomendacoes.append(html.Li([
-            html.Span("Contínuo: ", className="font-weight-bold text-secondary"),
-            "Implementar sistema de alertas automáticos para notificar quando exames estiverem a 60 dias do vencimento."
+            html.Span("URGENTE: ", className="text-danger font-weight-bold"),
+            f"Regularizar {vencidos:,} exames vencidos."
         ]))
-        
-        estrategias_content = [
-            html.H5("Recomendações Estratégicas", className="mb-3"),
-            html.Ol(recomendacoes, className="pl-3")
-        ]
-        
-        # Se for MANSERV e tivermos pelo menos 5 exames
-        if selected_empresa != 'todas' and 'MANSERV' in selected_empresa.upper() and filtered_df.shape[0] >= 5:
-            # Adicionar análise específica
-            estrategias_content.append(html.Div([
-                html.H5("Análise Específica", className="mt-4 mb-3"),
-                html.P([
-                    "A empresa ",
-                    html.Strong(selected_empresa),
-                    " apresenta uma situação que requer atenção especial com ",
-                    html.Strong(f"{vencidos:,} exames vencidos"),
-                    " e ",
-                    html.Strong(f"{pendentes:,} exames pendentes"),
-                    ". Recomendamos agendar uma campanha InCompany imediata para regularização."
-                ]),
-                html.P([
-                    "Sugerimos também um acompanhamento mensal do status dos exames para evitar acúmulo de vencimentos e garantir a conformidade legal."
-                ])
-            ], className="mt-3 p-3 bg-light border rounded"))
-    else:
-        estrategias_content = [
-            html.H5("Recomendações Estratégicas", className="mb-3"),
-            html.P("Sem dados suficientes para gerar recomendações.", className="text-muted")
-        ]
     
-    return incompany_content, criticality_content, estrategias_content
+    if pendentes > 0:
+        recomendacoes.append(html.Li([
+            html.Span("ALTA PRIORIDADE: ", className="text-warning font-weight-bold"),
+            f"Definir datas para {pendentes:,} exames pendentes."
+        ]))
+    
+    if a_vencer_30 > 0:
+        recomendacoes.append(html.Li([
+            html.Span("PRIORIDADE: ", className="text-primary font-weight-bold"),
+            f"Planejar {a_vencer_30:,} exames a vencer em 30 dias."
+        ]))
+    
+    if a_vencer_60 + a_vencer_90 > 0:
+        recomendacoes.append(html.Li([
+            html.Span("PLANEJAMENTO: ", className="text-info font-weight-bold"),
+            f"Preparar para {a_vencer_60 + a_vencer_90:,} exames a vencer em 60-90 dias."
+        ]))
+    
+    # Verificar elegibilidade para InCompany
+    if empresa != 'todas' and summary_data and 'incompany_eligibility' in summary_data:
+        incompany_data = summary_data['incompany_eligibility']
+        if empresa in incompany_data and any(count >= 20 for count in incompany_data[empresa].values()):
+            recomendacoes.append(html.Li([
+                html.Span("INCOMPANY: ", className="text-success font-weight-bold"),
+                f"Empresa elegível para programa InCompany em alguns meses."
+            ]))
+    
+    # Se não houver recomendações específicas
+    if not recomendacoes:
+        if sum(status_counts.values()) > 0:
+            return html.P("Não há ações críticas necessárias no momento.", className="text-success")
+        else:
+            return html.P("Sem dados suficientes para gerar recomendações.", className="text-muted")
+    
+    return html.Ol(recomendacoes)
 
-# Executar o aplicativo
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8050))
-    app.run(host="0.0.0.0", port=port)
+# Iniciar o servidor com configurações otimizadas
+if __name__ == '__main__':
+    # Verificar se estamos no Render
+    if 'RENDER' in os.environ:
+        # No Render, usar configurações de produção
+        port = int(os.environ.get('PORT', 8080))
+        app.run_server(host='0.0.0.0', port=port)
+    else:
+        # Localmente, usar configurações de desenvolvimento
+        app.run_server(debug=False)  # Desativar debug para economia de memória
